@@ -42,6 +42,7 @@ npm ci && npm start
 | 约束预检接口 | `POST http://localhost:3000/api/v1/merges/:id/constraint-preview` |
 | 归属预检接口 | `POST http://localhost:3000/api/v1/merges/:id/ownership-preview` |
 | 重启编排接口 | `POST http://localhost:3000/api/v1/merges/:id/restart-plan` |
+| 灰度批次规划接口 | `POST http://localhost:3000/api/v1/merges/:id/rollout-plan` |
 
 ## 配置项（环境变量）
 
@@ -69,6 +70,7 @@ npm ci && npm start
 | `POST` | `/api/v1/merges/:id/constraint-preview` | 对干净合并记录提交一组条件规则（`when` 指针值与 `equals` 深度相等时 `require` 指针必须存在），在基准 / A 单独 / B 单独 / 合并结果四种状态上评估并分类合并结果中的违规（不修改记录） |
 | `POST` | `/api/v1/merges/:id/ownership-preview` | 对任意已保存记录提交路径归属规则（唯一 `prefix` → `owner` A/B），按基准坐标最长前缀逐条检查原始操作的归属，返回可发布布尔值与违规明细（不修改记录） |
 | `POST` | `/api/v1/merges/:id/restart-plan` | 对干净合并记录提交服务清单（唯一 `id`、读取配置的 `reads` 指针、依赖 `dependsOn`），比较 base 与 merged 得出变更路径，段前缀匹配出直接受影响服务并沿依赖反方向传播，强连通分量合组后按依赖先行分轮输出重启编排（不修改记录） |
+| `POST` | `/api/v1/merges/:id/rollout-plan` | 对干净合并记录提交 1～12 个租户组（唯一组 `id`、非空且全局不重复的租户 ID 列表）与 2～5 个严格递增的累计覆盖百分比（1～100 整数、末阶段为 100），把每个组整体分配到唯一进入阶段，在满足各阶段 `ceil(总人数×百分比/100)` 下限的前提下最小化各阶段实际人数超出目标人数之和，并列时按组 ID 升序的进入阶段编号序列取字典序最小（不修改记录） |
 | `POST` | `/api/v1/rebases` | 变基预演：把基于 `base` 的 `patch` 迁移到新版本 `onto`，返回 `merged` 与相对 `onto` 的 `rebasedPatch`（服务端重放校验），冲突时不返回可执行补丁 |
 | `DELETE` | `/api/v1/merges/:id` | 删除单条预演（`204`） |
 
@@ -752,6 +754,128 @@ curl -s -X POST "http://localhost:3000/api/v1/merges/$id/restart-plan" \
 # => 200；5 个受影响服务分 3 轮重启，scheduler 不受影响
 ```
 
+### `POST /api/v1/merges/:id/rollout-plan`（租户灰度批次规划）
+
+对一条**已保存且合并成功（`status: "clean"`）**的记录，提交**租户组**与**累计覆盖百分比序列**，
+服务把每个租户组**整体**分配到唯一一个「进入阶段」（此后持续覆盖），给出总超出人数最小、
+并列时组 ID 字典序最优的灰度批次计划。**规划不会修改已保存的记录**，且**与输入顺序无关**
+（组与租户在响应中一律按 ID 升序输出）。
+
+请求体（也见 `examples/rollout-plan-request.json`，或 `GET /api/v1/example`）：
+
+```json
+{
+  "groups": [
+    { "id": "core",   "tenantIds": ["t3", "t4", "t5"] },
+    { "id": "rest",   "tenantIds": ["t8", "t9", "t10"] },
+    { "id": "canary", "tenantIds": ["t1", "t2"] },
+    { "id": "early",  "tenantIds": ["t6", "t7"] }
+  ],
+  "percentages": [20, 50, 100]
+}
+```
+
+- `groups`：**1～12 个**租户组；`id` 为非空字符串且组内唯一；`tenantIds` 为**非空**的租户
+  ID 字符串数组，所有租户 ID **跨组全局不重复**（组内重复同样拒绝）；不识别多余字段。
+- `percentages`：**2～5 个**累计覆盖百分比，均为 **1～100 的整数**、**严格递增**且**末阶段
+  必须为 100**（末阶段覆盖全部租户）。
+
+#### 规划规则
+
+- 每个组只能在某一个阶段**整体进入**，进入后在后续阶段持续覆盖；阶段 k 的累计人数必须
+  **不少于** `ceil(总人数 × percentages[k] / 100)`（目标人数随响应逐阶段给出）。
+- 在所有可行分配中**最小化各阶段实际累计人数超出目标人数之和**（末阶段实际人数恒为总人数，
+  超出恒为 0）。
+- 超出总和相同时，按**组 ID 升序**排列各组的**进入阶段编号**组成序列，取**字典序最小**
+  ——即让组 ID 较小的组尽可能早进入。
+- 允许某个中间阶段不新增任何组（相邻百分比的 `ceil` 目标可能相同）；该阶段照常累计超出。
+
+#### 响应结构（`200`）
+
+以 `examples/merge-request.json` 创建记录、再提交
+`examples/rollout-plan-request.json` 为例（共 10 个租户，目标 2 / 5 / 10 人）：
+
+```jsonc
+{
+  "id": "...",
+  "createdAt": "...",
+  "status": "clean",
+  "totalTenants": 10,
+  "totalGroups": 4,
+  "stages": [
+    {
+      "stage": 1,
+      "targetPercentage": 20,
+      "targetTenants": 2,
+      "newGroups": ["canary"],            // 本阶段新进入的组（组 ID 升序）
+      "newTenantIds": ["t1", "t2"],       // 本阶段新覆盖的租户（租户 ID 升序）
+      "cumulativeGroups": ["canary"],     // 截至本阶段已覆盖的组
+      "cumulativeTenantIds": ["t1", "t2"],// 截至本阶段已覆盖的全部租户
+      "cumulativeTenants": 2,
+      "actualCoveragePercent": 20,        // 实际累计覆盖率（百分比，保留两位小数）
+      "overage": 0                        // 实际人数超出目标人数的数量
+    },
+    {
+      "stage": 2,
+      "targetPercentage": 50,
+      "targetTenants": 5,
+      "newGroups": ["core"],
+      "newTenantIds": ["t3", "t4", "t5"],
+      "cumulativeGroups": ["canary", "core"],
+      "cumulativeTenantIds": ["t1", "t2", "t3", "t4", "t5"],
+      "cumulativeTenants": 5,
+      "actualCoveragePercent": 50,
+      "overage": 0
+    },
+    {
+      "stage": 3,
+      "targetPercentage": 100,
+      "targetTenants": 10,
+      "newGroups": ["early", "rest"],
+      "newTenantIds": ["t10", "t6", "t7", "t8", "t9"],
+      "cumulativeGroups": ["canary", "core", "early", "rest"],
+      "cumulativeTenantIds": ["t1", "t10", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9"],
+      "cumulativeTenants": 10,
+      "actualCoveragePercent": 100,
+      "overage": 0
+    }
+  ],
+  "totalOverage": 0                       // 各阶段 overage 之和（优化目标）
+}
+```
+
+示例中 `canary` 与 `early` 都是 2 人、均可在阶段 1 恰好达标（超出 0），`core` 与 `rest` 都是
+3 人、均可在阶段 2 恰好补足到 5 人；并列时按组 ID 升序的进入阶段序列字典序最小，故
+`canary`（最小 ID）进入阶段 1、`core` 进入阶段 2，`early` 与 `rest` 留到阶段 3。请求中组与
+租户的顺序无论如何打乱，响应完全一致。
+
+#### 状态码
+
+- **干净记录 → `200`**：返回上述结构。
+- **输入非法 → `422`**：`{ statusCode, error, code: "INVALID_ROLLOUT_PLAN", message, ... }`：
+  顶层 `issues` 列出请求级问题（组/阶段数量越界、百分比非整数/越界/非严格递增/末值非 100 等），
+  `invalid` 按请求顺序列出问题组的 `index`、`id`（无法解析时为 `null`）与 `issues`
+  （非对象、`id` 为空或重复、`tenantIds` 为空或含非字符串、租户 ID 全局重复、多余字段等）。
+- **记录不存在 → `404`**；**记录为冲突状态（`status: "conflict"`）→ `409`**（`409` 先于
+  请求体校验；不修改记录）；请求体缺 `groups` / `percentages` 等结构问题 → `400`。
+- 规划是已保存记录与请求内容的**纯函数**：不修改记录，不读取记录内容（仅要求其为干净记录）。
+
+完整流程示例：
+
+```bash
+# 1) 用干净合并示例创建记录，记下 id
+id=$(curl -s -X POST http://localhost:3000/api/v1/merges \
+  -H 'Content-Type: application/json' \
+  -d @examples/merge-request.json | jq -r .id)
+
+# 2) 提交租户组与覆盖百分比，获取灰度批次规划
+curl -s -X POST "http://localhost:3000/api/v1/merges/$id/rollout-plan" \
+  -H 'Content-Type: application/json' \
+  -d @examples/rollout-plan-request.json | jq
+# => 200；canary 第 1 批（2 人 / 20%）、core 第 2 批（累计 5 人 / 50%）、
+#    early+rest 第 3 批（10 人 / 100%），总超出 0
+```
+
 ### `POST /api/v1/rebases`（变基预演）
 
 把一份**基于旧版本 `base` 的待发布补丁**迁移到上游新版本 `onto` 上。服务先把 `base` → `onto`
@@ -945,6 +1069,9 @@ curl -s -X POST http://localhost:3000/api/v1/merges/<id>/ownership-preview \
 curl -s -X POST http://localhost:3000/api/v1/merges/<id>/restart-plan \
   -H 'Content-Type: application/json' \
   -d @examples/restart-plan-request.json | jq                          # 服务重启编排（变更路径 + 分轮计划）
+curl -s -X POST http://localhost:3000/api/v1/merges/<id>/rollout-plan \
+  -H 'Content-Type: application/json' \
+  -d @examples/rollout-plan-request.json | jq                          # 租户灰度批次规划（各阶段新增组/租户 + 实际覆盖率）
 curl -s -X POST http://localhost:3000/api/v1/rebases \
   -H 'Content-Type: application/json' \
   -d @examples/rebase-request.json | jq                                # 变基预演（merged + rebasedPatch）
@@ -1027,7 +1154,13 @@ replace/remove/覆盖式 add 的后代规则保护（逐条命中、按前缀排
 段前缀直接命中（双向前缀、解码后比较、根读取命中一切）、沿依赖反方向传播、
 强连通分量合组、依赖先行分轮与组内/轮内按 id 排序、无变化空计划、
 无效清单 `422`（非法指针 / 重复 id / 未知依赖逐项列出）、冲突记录 `409`、
-未知记录 `404`、记录不变与重复请求逐字节一致等。
+未知记录 `404`、记录不变与重复请求逐字节一致，以及租户灰度批次规划的
+`ceil(总人数×百分比/100)` 累计目标、组整体进入单阶段并持续覆盖、
+各阶段超出目标人数总和最小化、并列时组 ID 升序进入阶段序列字典序最小
+（最小 ID 尽早进入、成本优先于字典序）、允许空中间阶段、实际覆盖率两位小数、
+输入顺序无关、租户/组 ID 全局去重校验、1～12 组与 2～5 阶段边界、
+非法请求 `422`（请求级 issues 与逐组 invalid）、冲突记录 `409`、
+未知记录 `404`、记录不变与重复请求一致等。
 
 ## 项目结构
 
@@ -1044,6 +1177,7 @@ replace/remove/覆盖式 add 的后代规则保护（逐条命中、按前缀排
 │   ├── constraint.js          # 条件约束预检：规则校验（422）→ 基准/A 单独/B 单独/合并结果四状态评估 → 合并违规归因（既存/A/B/组合）
 │   ├── ownership.js           # 路径归属预检：规则校验（422）→ 基准坐标最长前缀归属 → 逐条检查原始操作（数组插入按父数组、后代规则保护）→ 可发布判定
 │   ├── restart.js             # 服务重启编排：base/merged 递归比较（缺失≠null、数组记数组路径）→ 段前缀直接命中 → 依赖反方向传播 → 强连通分量合组、依赖先行分轮
+│   ├── rollout.js             # 租户灰度批次规划：组/百分比校验（422）→ (阶段, 覆盖组掩码) 子集动态规划 → 最小化各阶段超出人数总和、字典序打破并列 → 逐阶段新增组/租户与实际覆盖率
 │   ├── rebase.js              # 变基：base→onto 转基准坐标操作（数组 LCS 对齐、缝隙插入）→ 与客户端补丁合并 → 生成并重放校验 onto 相对补丁
 │   ├── store.js               # 内存存储（FIFO 淘汰）
 │   └── example.js             # 内置示例请求
@@ -1086,6 +1220,15 @@ replace/remove/覆盖式 add 的后代规则保护（逐条命中、按前缀排
   强连通分量合为一组，组间依赖先行、每轮输出全部就绪组，组内与轮内按 `id` 字典序
   排序。编排不修改记录，`base` 与 `merged` 一致时返回空计划；非法指针、重复 `id`
   或未知依赖返回 `422` 并逐项列出问题，记录不存在返回 `404`，非干净记录返回 `409`。
+- 租户灰度批次规划（`POST /api/v1/merges/:id/rollout-plan`）接收 1～12 个租户组（唯一
+  组 `id`、非空的租户 ID 列表且租户 ID 全局不重复）与 2～5 个 1～100 的整数累计覆盖
+  百分比（严格递增、末阶段为 100），把每个组整体分配到唯一一个进入阶段并持续覆盖；
+  各阶段累计人数下限为 `ceil(总人数×百分比/100)`，规划在所有可行分配中最小化各阶段
+  实际人数超出目标人数之和（末阶段恒为 0），并列时取「组 ID 升序对应的进入阶段编号
+  序列」字典序最小者（组 ID 越小越优先早进入）。规划不读取记录内容、不修改记录，组与
+  租户均按 ID 升序输出因而与输入顺序无关；非法输入（数量越界、百分比非整数/不递增/
+  末值非 100、组 ID 或租户 ID 重复等）返回 `422`（请求级 `issues` 与逐组 `invalid`），
+  记录不存在返回 `404`，非干净记录返回 `409`。
 - 变基（`POST /api/v1/rebases`）是无状态预演：不写内存存储、不返回记录 `id`；`upstream`
   为 `base`→`onto` 的基准坐标操作（数组合并按缝隙寻址，不能直接当顺序补丁执行），
   `rebasedPatch` 才是相对 `onto` 的可执行 RFC 6902 补丁（服务端已重放校验等于 `merged`）；

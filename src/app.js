@@ -13,6 +13,7 @@ import {
   OwnershipError,
 } from './ownership.js';
 import { buildRestartPlan, validateServices, RestartError } from './restart.js';
+import { buildRolloutPlan, validateRolloutRequest, RolloutError } from './rollout.js';
 import { MergeStore } from './store.js';
 import {
   EXAMPLE_REQUEST,
@@ -22,6 +23,7 @@ import {
   EXAMPLE_CONSTRAINT_PREVIEW_REQUEST,
   EXAMPLE_OWNERSHIP_PREVIEW_REQUEST,
   EXAMPLE_RESTART_PLAN_REQUEST,
+  EXAMPLE_ROLLOUT_PLAN_REQUEST,
 } from './example.js';
 
 export const VERSION = '1.0.0';
@@ -112,6 +114,19 @@ const restartBodySchema = {
   },
 };
 
+const rolloutBodySchema = {
+  type: 'object',
+  required: ['groups', 'percentages'],
+  additionalProperties: false,
+  properties: {
+    // Per-group shape and the percentage sequence are validated in the
+    // handler so that invalid requests are reported as 422
+    // (INVALID_ROLLOUT_PLAN) with detailed issues, not as 400.
+    groups: { type: 'array' },
+    percentages: { type: 'array' },
+  },
+};
+
 function publicRecord(record) {
   const { id, status, merged, conflicts, stats, createdAt } = record;
   return { id, status, merged, conflicts, stats, createdAt };
@@ -184,6 +199,8 @@ export function buildApp(options = {}) {
         'check the saved patchA/patchB operations against path-ownership rules (unique RFC 6901 prefix -> owner A/B): longest-prefix attribution in base coordinates, array inserts attributed to the parent array, other-side descendant rules protected from replace/remove; returns a publishable verdict without modifying the record',
       'POST /api/v1/merges/:id/restart-plan':
         'orchestrate service restarts for a clean record: diff base vs merged (missing vs null distinguished, array changes recorded at the array path), mark services whose RFC 6901 reads segment-prefix a changed path as directly affected, propagate impact along reverse dependencies, then schedule affected services in dependency-first rounds (SCCs grouped, ids sorted) without modifying the record',
+      'POST /api/v1/merges/:id/rollout-plan':
+        'plan tenant grayscale batches for a clean record from 1-12 tenant groups (unique ids, non-empty globally-unique tenant id lists) and 2-5 strictly increasing cumulative coverage percentages ending at 100; assign each group wholly to one entry stage minimizing total overage against ceil(total*p/100) targets, ties broken by the lexicographically smallest group-id-ordered entry-stage sequence, without modifying the record',
       'POST /api/v1/rebases':
         'rebase { base, patch, onto }: merge the client patch with the base->onto delta and return merged plus an onto-relative rebasedPatch (replayed server-side), or structured conflicts',
       'DELETE /api/v1/merges/:id': 'delete one rehearsal',
@@ -209,6 +226,10 @@ export function buildApp(options = {}) {
       'POST the body below to /api/v1/merges/:id/restart-plan ' +
       '(use the id of a clean merge record, e.g. one created from mergeRequest)',
     restartPlanRequest: EXAMPLE_RESTART_PLAN_REQUEST,
+    rolloutPlanDescription:
+      'POST the body below to /api/v1/merges/:id/rollout-plan ' +
+      '(use the id of a clean merge record, e.g. one created from mergeRequest)',
+    rolloutPlanRequest: EXAMPLE_ROLLOUT_PLAN_REQUEST,
   }));
 
   app.post('/api/v1/merges', { schema: { body: mergeBodySchema } }, async (req, reply) => {
@@ -532,6 +553,56 @@ export function buildApp(options = {}) {
       }
       // Pure plan: the stored record is never modified.
       const plan = buildRestartPlan(record, services);
+      return {
+        id: record.id,
+        createdAt: record.createdAt,
+        status: record.status,
+        ...plan,
+      };
+    },
+  );
+
+  app.post(
+    '/api/v1/merges/:id/rollout-plan',
+    { schema: { body: rolloutBodySchema } },
+    async (req, reply) => {
+      const record = store.get(req.params.id);
+      if (!record) {
+        return reply.code(404).send({
+          statusCode: 404,
+          error: 'Not Found',
+          message: `no rehearsal stored with id ${req.params.id}`,
+        });
+      }
+      if (record.status !== 'clean') {
+        // Rollout batches belong to a published merge. The stored record is
+        // never modified.
+        return reply.code(409).send({
+          statusCode: 409,
+          error: 'Conflict',
+          message:
+            `rehearsal ${req.params.id} has status "${record.status}"; ` +
+            'rollout plan requires a clean merge record',
+        });
+      }
+      let normalized;
+      try {
+        normalized = validateRolloutRequest(req.body.groups, req.body.percentages);
+      } catch (err) {
+        if (err instanceof RolloutError) {
+          return reply.code(422).send({
+            statusCode: 422,
+            error: 'Unprocessable Entity',
+            code: err.code,
+            message: err.message,
+            ...err.details,
+          });
+        }
+        throw err;
+      }
+      // Pure plan: the stored record is never modified. Only the request
+      // shapes the result, and normalized input order makes it deterministic.
+      const plan = buildRolloutPlan(normalized.groups, normalized.percentages);
       return {
         id: record.id,
         createdAt: record.createdAt,

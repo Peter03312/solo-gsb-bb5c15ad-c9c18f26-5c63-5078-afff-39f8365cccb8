@@ -185,3 +185,24 @@ export const EXAMPLE_RESTART_PLAN_REQUEST = {
     { id: 'worker', reads: ['/features/cache'], dependsOn: ['api'] },
   ],
 };
+
+/**
+ * Canned rollout-plan payload, mirrored in examples/rollout-plan-request.json.
+ * Four groups totaling 10 tenants with cumulative targets 20% / 50% / 100%
+ * (2 / 5 / 10 tenants). The request order is shuffled on purpose: the result
+ * is order-independent. Both {canary} and {early} satisfy stage 1 exactly
+ * (2 tenants, overage 0), and at stage 2 both {core} and {rest} do (3 more
+ * tenants, total 5, overage 0); the lexicographic tie-break on the
+ * group-id-ordered entry sequence lets the smallest-id feasible group enter
+ * first: canary in stage 1, core in stage 2, early + rest in stage 3
+ * (total overage 0).
+ */
+export const EXAMPLE_ROLLOUT_PLAN_REQUEST = {
+  groups: [
+    { id: 'core', tenantIds: ['t3', 't4', 't5'] },
+    { id: 'rest', tenantIds: ['t8', 't9', 't10'] },
+    { id: 'canary', tenantIds: ['t1', 't2'] },
+    { id: 'early', tenantIds: ['t6', 't7'] },
+  ],
+  percentages: [20, 50, 100],
+};

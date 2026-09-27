@@ -1,0 +1,9 @@
+{
+  "groups": [
+    { "id": "core", "tenantIds": ["t3", "t4", "t5"] },
+    { "id": "rest", "tenantIds": ["t8", "t9", "t10"] },
+    { "id": "canary", "tenantIds": ["t1", "t2"] },
+    { "id": "early", "tenantIds": ["t6", "t7"] }
+  ],
+  "percentages": [20, 50, 100]
+}
