@@ -1,0 +1,10 @@
+{
+  "services": [
+    { "id": "api", "reads": ["/servers", "/replicas"], "dependsOn": ["config-db"] },
+    { "id": "auth", "reads": ["/features/tracing"], "dependsOn": ["session"] },
+    { "id": "config-db", "reads": ["/features"], "dependsOn": [] },
+    { "id": "scheduler", "reads": ["/tags"], "dependsOn": [] },
+    { "id": "session", "reads": [], "dependsOn": ["auth"] },
+    { "id": "worker", "reads": ["/features/cache"], "dependsOn": ["api"] }
+  ]
+}
